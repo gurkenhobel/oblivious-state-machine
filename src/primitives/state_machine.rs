@@ -147,6 +147,13 @@ where
                 is_state_initialized = true;
             }
 
+            // Attempt to update.
+            log::trace!("[{id:?}] State update attempt");
+            state.update().map_err(|err| {
+                log::debug!("[{id:?}] State update attempt failed with: {err:?}");
+                StateMachineDriverError::StateError(err)
+            })?;
+
             // Attempt to advance.
             log::trace!("[{id:?}] State advance attempt");
             let advanced = state.advance().map_err(|err| {

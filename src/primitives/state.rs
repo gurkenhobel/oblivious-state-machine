@@ -11,6 +11,11 @@ pub trait State<Types: StateTypes>: Downcast + Debug {
         Vec::new()
     }
 
+    /// Update the state independently from external messages
+    fn update(&mut self) -> Result<(), Types::Err> {
+        Ok(())
+    }
+
     /// Deliver a message to the state to make progress.
     /// Default implementation just returns the message marking it as Unexpected.
     fn deliver(&mut self, message: Types::In) -> DeliveryStatus<Types::In, Types::Err> {
