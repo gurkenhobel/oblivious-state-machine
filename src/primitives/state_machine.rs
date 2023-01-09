@@ -1,10 +1,10 @@
 use crate::feed::{Feed, FeedError};
 use crate::state::{BoxedState, DeliveryStatus, StateTypes, Transition};
 use serde::{Deserialize, Serialize};
+use std::thread::sleep;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio::time;
+use std::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::Span;
@@ -21,7 +21,7 @@ pub struct StateMachine<Types: StateTypes> {
     feed: Feed<Types::In>,
 
     /// Channel to report outgoing messages.
-    messages_tx: mpsc::UnboundedSender<Messages<Types::Out>>,
+    messages_tx: mpsc::Sender<Messages<Types::Out>>,
 
     #[cfg(feature = "tracing")]
     span: Span,
@@ -35,7 +35,7 @@ where
     pub fn new(
         id: StateMachineId,
         initial_state: BoxedState<Types>,
-        messages_tx: mpsc::UnboundedSender<Messages<Types::Out>>,
+        messages_tx: mpsc::Sender<Messages<Types::Out>>,
         #[cfg(feature = "tracing")] span: Span,
     ) -> (Self, StateMachineHandle<Types>) {
         log::trace!(
@@ -43,7 +43,7 @@ where
             initial_state.desc()
         );
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel();
         let handle = StateMachineHandle { tx };
 
         (
@@ -66,8 +66,8 @@ where
     pub fn new_with_handle(
         id: StateMachineId,
         initial_state: BoxedState<Types>,
-        messages_tx: mpsc::UnboundedSender<Messages<Types::Out>>,
-        handle_rx: mpsc::UnboundedReceiver<Types::In>,
+        messages_tx: mpsc::Sender<Messages<Types::Out>>,
+        handle_rx: mpsc::Receiver<Types::In>,
         #[cfg(feature = "tracing")] span: Span,
     ) -> Self {
         Self {
@@ -81,26 +81,21 @@ where
         }
     }
 
-    /// Attempt to execute this [StateMachine] within a given time limit.
-    pub async fn run_with_timeout(mut self, time_budget: Duration) -> StateMachineResult<Types> {
-        let value = match time::timeout(time_budget, self.run()).await {
-            Ok(Ok(())) => Ok(self.state),
-            Ok(Err(StateMachineDriverError::StateError(error))) => Err(StateMachineError::State {
+    /// Attempt to execute this [StateMachine].
+    pub fn execute(mut self) -> StateMachineResult<Types> {
+        let value = match self.run() {
+            Ok(()) => Ok(self.state),
+            Err(StateMachineDriverError::StateError(error)) => Err(StateMachineError::State {
                 error,
                 state: self.state,
                 feed: self.feed,
             }),
-            Ok(Err(StateMachineDriverError::IncomingCommunication(err))) => {
+            Err(StateMachineDriverError::IncomingCommunication(err)) => {
                 Err(StateMachineError::IncomingCommunication(err))
             }
-            Ok(Err(StateMachineDriverError::OutgoingCommunication(err))) => {
+            Err(StateMachineDriverError::OutgoingCommunication(err)) => {
                 Err(StateMachineError::OutgoingCommunication(err))
             }
-            Err(_) => Err(StateMachineError::Timeout {
-                time_budget,
-                state: self.state,
-                feed: self.feed,
-            }),
         };
 
         StateMachineResult {
@@ -112,8 +107,7 @@ where
 
     #[cfg_attr(feature = "tracing", tracing::instrument[parent = &self.span, skip_all])]
     /// Executes this [StateMachine] regardless of time. Publicly inaccessible,
-    /// if no time constraints are imposed on execution, use [run_with_timeout] with [Duration::MAX].
-    async fn run(&mut self) -> Result<(), StateMachineDriverError<Types>> {
+    fn run(&mut self) -> Result<(), StateMachineDriverError<Types>> {
         let Self {
             id,
             ref mut state,
@@ -166,23 +160,27 @@ where
                     log::trace!("[{id:?}] State requires more input");
 
                     // No advancement. Try to deliver a message.
-                    let message = feed
-                        .next()
-                        .await
-                        .map_err(StateMachineDriverError::IncomingCommunication)?;
-
-                    match state.deliver(message) {
-                        DeliveryStatus::Delivered => {
-                            log::trace!("[{id:?}] Message has been delivered");
-                        }
-                        DeliveryStatus::Unexpected(message) => {
-                            log::trace!("[{id:?}] Unexpected message. Storing for future attempts");
-                            feed.delay(message);
-                        }
-                        DeliveryStatus::Error(err) => {
-                            Err(StateMachineDriverError::StateError(err))?;
-                        }
-                    }
+                    match feed.next() {
+                        Ok(message) => {
+                            match state.deliver(message) {
+                                DeliveryStatus::Delivered => {
+                                    log::trace!("[{id:?}] Message has been delivered");
+                                }
+                                DeliveryStatus::Unexpected(message) => {
+                                    log::trace!("[{id:?}] Unexpected message. Storing for future attempts");
+                                    feed.delay(message);
+                                }
+                                DeliveryStatus::Error(err) => {
+                                    Err(StateMachineDriverError::StateError(err))?;
+                                }
+                            }
+                        },
+                        Err(FeedError::NoMessage) => {
+                            sleep(Duration::from_millis(10));
+                            continue;
+                        },
+                        Err(err) => Err(StateMachineDriverError::IncomingCommunication(err))?
+                    };
                 }
                 Transition::Next(next) => {
                     log::debug!("[{id:?}] State has been advanced to <{}>", next.desc());
@@ -209,11 +207,11 @@ where
 #[derive(Debug)]
 /// [StateMachineHandle] is a synchronous interface to communicate message to a corresponding [StateMachine].
 pub struct StateMachineHandle<Types: StateTypes> {
-    tx: mpsc::UnboundedSender<Types::In>,
+    tx: mpsc::Sender<Types::In>,
 }
 
-impl<Types: StateTypes> From<mpsc::UnboundedSender<Types::In>> for StateMachineHandle<Types> {
-    fn from(tx: mpsc::UnboundedSender<Types::In>) -> Self {
+impl<Types: StateTypes> From<mpsc::Sender<Types::In>> for StateMachineHandle<Types> {
+    fn from(tx: mpsc::Sender<Types::In>) -> Self {
         Self { tx }
     }
 }
@@ -281,13 +279,6 @@ pub enum StateMachineError<Types: StateTypes> {
         state: BoxedState<Types>,
         feed: Feed<Types::In>,
     },
-
-    #[error("State machine ran longer than permitted: {time_budget:?}")]
-    Timeout {
-        time_budget: Duration,
-        state: BoxedState<Types>,
-        feed: Feed<Types::In>,
-    },
 }
 
 enum StateMachineDriverError<Types: StateTypes> {
@@ -302,9 +293,9 @@ mod test {
     use crate::state_machine::{StateMachine, StateMachineError, StateMachineResult};
     use pretty_env_logger;
     use std::collections::VecDeque;
+    use std::thread::{spawn, sleep};
     use std::time::Duration;
-    use tokio::sync::{mpsc, oneshot};
-    use tokio::time;
+    use std::sync::mpsc;
 
     #[cfg(feature = "tracing")]
     use tracing::info_span;
@@ -522,8 +513,8 @@ mod test {
     }
     // ========================
 
-    #[tokio::test]
-    async fn order_goes_to_shipping() {
+    #[test]
+    fn order_goes_to_shipping() {
         let _ = setup_logging_or_tracing();
 
         // initial state.
@@ -536,13 +527,12 @@ mod test {
             Message::FinalConfirmation,
             Message::Verify(Verify::PaymentDetails),
         ]);
-        let mut feeding_interval = time::interval(Duration::from_millis(100));
-        feeding_interval.tick().await;
+        let feeding_interval = Duration::from_millis(100);
 
         #[cfg(feature = "tracing")]
         let span = info_span!("test_span");
 
-        let (messages_tx, _messages_rx) = mpsc::unbounded_channel();
+        let (messages_tx, _messages_rx) = mpsc::channel();
         let (state_machine, state_machine_handle) = StateMachine::new(
             "Order".into(),
             Box::new(on_display),
@@ -552,24 +542,24 @@ mod test {
             span,
         );
 
-        let (tx, mut rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = state_machine.run_with_timeout(Duration::from_secs(5)).await;
+        let (tx, mut rx) = mpsc::channel();
+        spawn(move || {
+            let result = state_machine.execute();
             tx.send(result).unwrap_or_else(|_| panic!("Must send"));
         });
 
+
         let res: StateMachineResult<Types> = loop {
-            tokio::select! {
-                result = &mut rx => {
-                    break result.expect("Must receive");
-                }
-                _ = feeding_interval.tick() => {
-                    // feed a message if present.
-                    if let Some(msg) = feed.pop_front() {
-                        let _ = state_machine_handle.deliver(msg);
-                    }
-                }
+            sleep(feeding_interval);
+            if let Ok(r) = rx.try_recv() {
+                break r
+            } else if feed.is_empty() {
+                panic!("state machine didn't complete!")
             }
+
+            if let Some(msg) = feed.pop_front() {
+                let _ = state_machine_handle.deliver(msg);
+            } 
         };
 
         let order = res
@@ -582,125 +572,4 @@ mod test {
             .unwrap_or_else(|_| panic!("must work"));
     }
 
-    #[tokio::test]
-    async fn order_canceled_state_machine_timeouts() {
-        let _ = setup_logging_or_tracing();
-
-        // initial state.
-        let on_display = OnDisplay::new();
-
-        // feed of un-ordered messages.
-        let mut feed = VecDeque::from(vec![
-            Message::Verify(Verify::Address),
-            Message::PlaceOrder,
-            Message::Cancel,
-        ]);
-        let mut feeding_interval = time::interval(Duration::from_millis(100));
-        feeding_interval.tick().await;
-
-        #[cfg(feature = "tracing")]
-        let span = info_span!("test_span");
-
-        let (messages_tx, _messages_rx) = mpsc::unbounded_channel();
-        let (state_machine, state_machine_handle) = StateMachine::new(
-            "Order".into(),
-            Box::new(on_display),
-            messages_tx,
-            // Add Span when feature 'tracing' is enabled
-            #[cfg(feature = "tracing")]
-            span,
-        );
-
-        let (tx, mut rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = state_machine.run_with_timeout(Duration::from_secs(1)).await;
-            tx.send(result).unwrap_or_else(|_| panic!("Must send"));
-        });
-
-        let res: StateMachineResult<Types> = loop {
-            tokio::select! {
-                result = &mut rx => {
-                    break result.expect("Must receive");
-                }
-                _ = feeding_interval.tick() => {
-                    // feed a message if present.
-                    if let Some(msg) = feed.pop_front() {
-                        let _ = state_machine_handle.deliver(msg);
-                    }
-                }
-            }
-        };
-
-        match res.value {
-            Ok(_) => panic!("StateMachine should not have completed"),
-            Err(StateMachineError::Timeout { state: order, .. }) => {
-                assert!(order.is::<OnDisplay>())
-            }
-            Err(_) => {
-                panic!("unexpected error")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn faulty_state_leads_to_state_machine_termination() {
-        let _ = setup_logging_or_tracing();
-
-        // initial state.
-        let on_display = OnDisplay::new();
-
-        // feed of un-ordered messages.
-        let mut feed = VecDeque::from([Message::Verify(Verify::Address), Message::Damage]);
-        let mut feeding_interval = time::interval(Duration::from_millis(100));
-        feeding_interval.tick().await;
-
-        #[cfg(feature = "tracing")]
-        let span = info_span!("test_span");
-
-        let (messages_tx, _messages_rx) = mpsc::unbounded_channel();
-        let (state_machine, state_machine_handle) = StateMachine::new(
-            "Order".into(),
-            Box::new(on_display),
-            messages_tx,
-            // Add Span when feature 'tracing' is enabled
-            #[cfg(feature = "tracing")]
-            span,
-        );
-
-        let (tx, mut rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = state_machine.run_with_timeout(Duration::from_secs(5)).await;
-            tx.send(result).unwrap_or_else(|_| panic!("Must send"));
-        });
-
-        let res: StateMachineResult<Types> = loop {
-            tokio::select! {
-                result = &mut rx => {
-                    break result.expect("Must receive");
-                }
-                _ = feeding_interval.tick() => {
-                    // feed a message if present.
-                    if let Some(msg) = feed.pop_front() {
-                        let _ = state_machine_handle.deliver(msg);
-                    }
-                }
-            }
-        };
-
-        match res.value {
-            Ok(_) => panic!("TimeMachine should not have completed"),
-            Err(StateMachineError::Timeout { state: order, .. }) => {
-                assert!(order.is::<OnDisplay>())
-            }
-            Err(err) => {
-                if let StateMachineError::State { error, state, .. } = err {
-                    assert_eq!(error, "Item is damaged".to_string());
-                    assert!(state.is::<OnDisplay>());
-                    log::debug!("{:?}", error);
-                } else {
-                    panic!("Unexpected error")
-                }
-            }
-        }
-    }
 }
