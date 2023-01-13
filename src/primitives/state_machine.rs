@@ -170,6 +170,9 @@ where
                                     log::trace!("[{id:?}] Unexpected message. Storing for future attempts");
                                     feed.delay(message);
                                 }
+                                DeliveryStatus::Rejected(_message) => {
+                                    log::trace!("[{id:?}] Unexpected message. It will be dropped");
+                                }
                                 DeliveryStatus::Error(err) => {
                                     Err(StateMachineDriverError::StateError(err))?;
                                 }
