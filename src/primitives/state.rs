@@ -7,7 +7,7 @@ use std::fmt::Debug;
 pub trait State<Types: StateTypes>: Downcast + Debug {
     fn desc(&self) -> String;
 
-    fn initialize(&self) -> Vec<Types::Out> {
+    fn initialize(&mut self) -> Vec<Types::Out> {
         Vec::new()
     }
 
@@ -81,6 +81,7 @@ pub trait StateTypes: 'static {
 pub enum DeliveryStatus<U: Debug, E: Debug> {
     Delivered,
     Unexpected(U),
+    Rejected(U),
     Error(E),
 }
 
