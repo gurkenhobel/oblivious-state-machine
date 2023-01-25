@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use thiserror::Error;
-use std::sync::mpsc::{self, TryRecvError};
+use tokio::sync::mpsc;
 
 /// [Feed] combines polling from a queue of messages and a channel. Message can be delayed
 /// and later placed in the queue.
@@ -11,14 +11,14 @@ pub struct Feed<T> {
     queue: VecDeque<T>,
 
     /// Channel to receive message to deliver..
-    feed: mpsc::Receiver<T>,
+    feed: mpsc::UnboundedReceiver<T>,
 
     /// Any message drawn from [Feed] can be delayed and later placed in the [queue].
     delayed: Vec<T>,
 }
 
 impl<T> Feed<T> {
-    pub(crate) fn new(feed: mpsc::Receiver<T>) -> Self {
+    pub(crate) fn new(feed: mpsc::UnboundedReceiver<T>) -> Self {
         Self {
             queue: VecDeque::new(),
             feed,
@@ -27,7 +27,7 @@ impl<T> Feed<T> {
     }
 
     /// Draw the next message either from [queue] or [feed].
-    pub(crate) fn next(&mut self) -> Result<T, FeedError> {
+    pub(crate) async fn next(&mut self) -> Result<T, FeedError> {
         if !self.queue.is_empty() {
             return self
                 .queue
@@ -35,11 +35,7 @@ impl<T> Feed<T> {
                 .ok_or_else(|| panic!("Popping a message from a non-empty queue must not fail"));
         }
 
-        match self.feed.try_recv() {
-            Ok(msg) => Ok(msg),
-            Err(TryRecvError::Empty)  => Err(FeedError::NoMessage),
-            Err(TryRecvError::Disconnected) => Err(FeedError::ChannelClosed)
-        }
+        self.feed.recv().await.ok_or(FeedError::ChannelClosed)
     }
 
     pub(crate) fn delay(&mut self, message: T) {
