@@ -1,8 +1,7 @@
 use crate::feed::{Feed, FeedError};
 use crate::state::{BoxedState, DeliveryStatus, StateTypes, Transition};
 use serde::{Deserialize, Serialize};
-use tokio::time;
-use std::thread::sleep;
+use tokio::time::{self, sleep};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -186,7 +185,7 @@ where
                             }
                         },
                         Err(FeedError::NoMessage) => {
-                            sleep(Duration::from_millis(10));
+                            sleep(Duration::from_millis(10)).await;
                             continue;
                         },
                         Err(err) => Err(StateMachineDriverError::IncomingCommunication(err))?
