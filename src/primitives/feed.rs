@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 /// [Feed] combines polling from a queue of messages and a channel. Message can be delayed
 /// and later placed in the queue.
@@ -34,9 +35,13 @@ impl<T> Feed<T> {
                 .pop_front()
                 .ok_or_else(|| panic!("Popping a message from a non-empty queue must not fail"));
         }
-
-        self.feed.recv().await.ok_or(FeedError::ChannelClosed)
+        match self.feed.try_recv() {
+            Ok(m) => Ok(m),
+            Err(err) if err == TryRecvError::Empty => Err(FeedError::NoMessage),
+            Err(_) => Err(FeedError::ChannelClosed)
+        }
     }
+
 
     pub(crate) fn delay(&mut self, message: T) {
         self.delayed.push(message);
